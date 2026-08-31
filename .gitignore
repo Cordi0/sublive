@@ -1,218 +1,295 @@
-# Byte-compiled / optimized / DLL files
-__pycache__/
-*.py[codz]
-*$py.class
+#!/usr/bin/env bash
+#
+# live_sub.sh — Check which subdomains from a list are actually alive
+#
+# Usage:
+#   ./live_sub.sh subdomains.txt
+#   ./live_sub.sh subdomains.txt --quick    (DNS only, skip HTTP check)
+#   cat subdomains.txt | ./live_sub.sh -
+#
+# Output:
+#   Saves live subdomains to: live_subdomains_<timestamp>.txt
+#   Color terminal output showing what's alive vs dead
 
-# C extensions
-*.so
+# ─── Colors ─────────────────────────────────────────────────────────────────
+G="\033[92m"   # green  - live
+Y="\033[93m"   # yellow - DNS resolves but no HTTP
+R="\033[91m"   # red    - dead
+B="\033[94m"   # blue   - info
+W="\033[97m"   # white
+N="\033[0m"    # reset
 
-# Distribution / packaging
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-share/python-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-MANIFEST
+# ─── Config ─────────────────────────────────────────────────────────────────
+TIMEOUT=3                  # curl / host timeout in seconds
+THREADS=20                 # parallel jobs
+OUTPUT="live_$(date +%Y%m%d_%H%M%S).txt"
 
-# PyInstaller
-#   Usually these files are written by a python script from a template
-#   before PyInstaller builds the exe, so as to inject date/other infos into it.
-*.manifest
-*.spec
+# ─── Check dependencies ─────────────────────────────────────────────────────
+check_deps() {
+    local missing=0
+    for cmd in curl host; do
+        if ! command -v "$cmd" &>/dev/null; then
+            echo -e "${R}[-]${N} Missing dependency: $cmd"
+            echo "    Install with: sudo apt install $cmd  (or brew, pkg, etc.)"
+            missing=1
+        fi
+    done
 
-# Installer logs
-pip-log.txt
-pip-delete-this-directory.txt
+    if [ "$missing" -eq 1 ]; then
+        echo -e "\n${R}[!]${N} Install missing tools and try again."
+        exit 1
+    fi
+}
 
-# Unit test / coverage reports
-htmlcov/
-.tox/
-.nox/
-.coverage
-.coverage.*
-.cache
-nosetests.xml
-coverage.xml
-*.cover
-*.py.cover
-.hypothesis/
-.pytest_cache/
-cover/
+# ─── Usage ──────────────────────────────────────────────────────────────────
+usage() {
+    echo -e "${B}╔══════════════════════════════════════════╗${N}"
+    echo -e "${B}║${N}         Live Subdomain Checker           ${B}║${N}"
+    echo -e "${B}╚══════════════════════════════════════════╝${N}"
+    echo ""
+    echo "Usage: $0 <file> [--quick]"
+    echo "       cat <file> | $0 - [--quick]"
+    echo ""
+    echo "Options:"
+    echo "  --quick     DNS resolution only, skip HTTP probe (faster)"
+    echo "  -h, --help  Show this help"
+    echo ""
+    echo "Examples:"
+    echo "  $0 subs.txt"
+    echo "  $0 subs.txt --quick"
+    echo "  cat subs.txt | $0 -"
+    echo ""
+    echo "Input format: one subdomain per line (with or without http://)"
+    echo "  sub.example.com"
+    echo "  api.example.com"
+    echo "  http://admin.example.com"
+    exit 0
+}
 
-# Translations
-*.mo
-*.pot
+# ─── Clean subdomain ────────────────────────────────────────────────────────
+clean_domain() {
+    # Strip http:// or https://, strip trailing slash, strip port
+    echo "$1" \
+        | sed -E 's|^https?://||' \
+        | sed 's|/.*||' \
+        | sed 's|:.*||' \
+        | tr -d '[:space:]'
+}
 
-# Django stuff:
-*.log
-local_settings.py
-db.sqlite3
-db.sqlite3-journal
+# ─── Check single subdomain ─────────────────────────────────────────────────
+# Returns: DNS status, HTTP status (if --quick not set)
+check_sub() {
+    local raw="$1"
+    local quick="$2"
+    local domain
+    domain=$(clean_domain "$raw")
+    [ -z "$domain" ] && return
 
-# Flask stuff:
-instance/
-.webassets-cache
+    # --- DNS resolution ---
+    # Try host command (fast, no extra deps)
+    local dns_result
+    dns_result=$(host "$domain" 2>/dev/null)
+    local dns_ok=0
+    local ip=""
 
-# Scrapy stuff:
-.scrapy
+    if echo "$dns_result" | grep -qE "has address|has IPv6 address"; then
+        dns_ok=1
+        ip=$(echo "$dns_result" | grep "has address" | head -1 | awk '{print $NF}')
+        [ -z "$ip" ] && ip=$(echo "$dns_result" | grep "has IPv6 address" | head -1 | awk '{print $NF}')
+    fi
 
-# Sphinx documentation
-docs/_build/
+    # Write to a temp result file for collection
+    if [ "$dns_ok" -eq 1 ]; then
+        if [ "$quick" = "1" ]; then
+            # Quick mode — just DNS, no HTTP
+            echo "DNSOK|$domain|$ip|SKIP" >> "$TMP_RESULTS"
+        else
+            # --- HTTP probe ---
+            # Try HTTPS first, fall back to HTTP
+            local http_code
+            http_code=$(curl -s -o /dev/null -w "%{http_code}" \
+                --connect-timeout "$TIMEOUT" \
+                --max-time "$((TIMEOUT + 2))" \
+                -k -L \
+                "https://$domain" 2>/dev/null)
 
-# PyBuilder
-.pybuilder/
-target/
+            if [ "$http_code" = "000" ]; then
+                # HTTPS failed — try HTTP
+                http_code=$(curl -s -o /dev/null -w "%{http_code}" \
+                    --connect-timeout "$TIMEOUT" \
+                    --max-time "$((TIMEOUT + 2))" \
+                    -k -L \
+                    "http://$domain" 2>/dev/null)
+                local proto="http"
+            else
+                local proto="https"
+            fi
 
-# Jupyter Notebook
-.ipynb_checkpoints
+            if [ "$http_code" != "000" ]; then
+                echo "LIVE|$domain|$ip|$proto://$domain ($http_code)" >> "$TMP_RESULTS"
+            else
+                echo "DNSOK|$domain|$ip|NO_HTTP" >> "$TMP_RESULTS"
+            fi
+        fi
+    fi
+}
 
-# IPython
-profile_default/
-ipython_config.py
+# ─── Export for parallel ────────────────────────────────────────────────────
+export -f check_sub clean_domain
+export TIMEOUT TMP_RESULTS
 
-# pyenv
-#   For a library or package, you might want to ignore these files since the code is
-#   intended to run in multiple environments; otherwise, check them in:
-# .python-version
+# ─── Main ────────────────────────────────────────────────────────────────────
+main() {
+    local input_file="$1"
+    local quick=0
+    shift 2>/dev/null || true
 
-# pipenv
-#   According to pypa/pipenv#598, it is recommended to include Pipfile.lock in version control.
-#   However, in case of collaboration, if having platform-specific dependencies or dependencies
-#   having no cross-platform support, pipenv may install dependencies that don't work, or not
-#   install all needed dependencies.
-# Pipfile.lock
+    # Parse flags
+    for arg in "$@"; do
+        case "$arg" in
+            --quick) quick=1 ;;
+            -h|--help) usage ;;
+        esac
+    done
 
-# UV
-#   Similar to Pipfile.lock, it is generally recommended to include uv.lock in version control.
-#   This is especially recommended for binary packages to ensure reproducibility, and is more
-#   commonly ignored for libraries.
-# uv.lock
+    # Read subdomains into an array
+    local subs=()
+    if [ "$input_file" = "-" ]; then
+        # Read from stdin
+        while IFS= read -r line; do
+            [ -n "$line" ] && subs+=("$line")
+        done < /dev/stdin
+    elif [ -f "$input_file" ]; then
+        while IFS= read -r line; do
+            [ -n "$line" ] && subs+=("$line")
+        done < "$input_file"
+    else
+        echo -e "${R}[!]${N} File not found: $input_file"
+        usage
+    fi
 
-# poetry
-#   Similar to Pipfile.lock, it is generally recommended to include poetry.lock in version control.
-#   This is especially recommended for binary packages to ensure reproducibility, and is more
-#   commonly ignored for libraries.
-#   https://python-poetry.org/docs/basic-usage/#commit-your-poetrylock-file-to-version-control
-# poetry.lock
-# poetry.toml
+    total=${#subs[@]}
+    if [ "$total" -eq 0 ]; then
+        echo -e "${R}[!]${N} No subdomains found in input."
+        exit 1
+    fi
 
-# pdm
-#   Similar to Pipfile.lock, it is generally recommended to include pdm.lock in version control.
-#   pdm recommends including project-wide configuration in pdm.toml, but excluding .pdm-python.
-#   https://pdm-project.org/en/latest/usage/project/#working-with-version-control
-# pdm.lock
-# pdm.toml
-.pdm-python
-.pdm-build/
+    # Temp file for parallel results
+    TMP_RESULTS=$(mktemp /tmp/live_sub_XXXXXX)
+    trap 'rm -f "$TMP_RESULTS"' EXIT
 
-# pixi
-#   Similar to Pipfile.lock, it is generally recommended to include pixi.lock in version control.
-# pixi.lock
-#   Pixi creates a virtual environment in the .pixi directory, just like venv module creates one
-#   in the .venv directory. It is recommended not to include this directory in version control.
-.pixi
+    echo -e "${B}[*]${N} Checking ${Y}$total${N} subdomains..."
+    echo -e "${B}[*]${N} Mode: $( [ "$quick" = "1" ] && echo 'DNS only (--quick)' || echo 'DNS + HTTP probe' )"
+    echo ""
 
-# PEP 582; used by e.g. github.com/David-OConnor/pyflow and github.com/pdm-project/pdm
-__pypackages__/
+    # Progress spinner
+    local checked=0
+    local pids=()
+    local max_jobs=$THREADS
 
-# Celery stuff
-celerybeat-schedule
-celerybeat.pid
+    for sub in "${subs[@]}"; do
+        # Run in background with job control
+        (
+            check_sub "$sub" "$quick"
+        ) &
+        pids+=($!)
 
-# Redis
-*.rdb
-*.aof
-*.pid
+        # Throttle to THREADS parallel jobs
+        while [ "${#pids[@]}" -ge "$max_jobs" ]; do
+            for i in "${!pids[@]}"; do
+                if ! kill -0 "${pids[$i]}" 2>/dev/null; then
+                    unset 'pids[i]'
+                fi
+            done
+            pids=("${pids[@]}")  # re-index
+            sleep 0.05
+        done
 
-# RabbitMQ
-mnesia/
-rabbitmq/
-rabbitmq-data/
+        # Progress
+        ((checked++))
+        printf "\r  ${B}[*]${N} Progress: ${Y}%d/%d${N} (%d%%)" "$checked" "$total" "$((checked * 100 / total))"
+    done
 
-# ActiveMQ
-activemq-data/
+    # Wait for remaining jobs
+    wait
+    printf "\r  ${B}[*]${N} Progress: ${G}%d/%d (100%%)${N}\n\n" "$total" "$total"
 
-# SageMath parsed files
-*.sage.py
+    # ─── Collect & display results ──────────────────────────────────────
+    local live_count=0
+    local dns_only_count=0
+    local live_hosts=()
+    local dns_only_hosts=()
 
-# Environments
-.env
-.envrc
-.venv
-env/
-venv/
-ENV/
-env.bak/
-venv.bak/
+    if [ -f "$TMP_RESULTS" ]; then
+        while IFS='|' read -r status domain ip extra; do
+            [ -z "$domain" ] && continue
+            if [ "$status" = "LIVE" ]; then
+                live_hosts+=("$domain|$ip|$extra")
+                ((live_count++))
+            elif [ "$status" = "DNSOK" ]; then
+                dns_only_hosts+=("$domain|$ip|$extra")
+                ((dns_only_count++))
+            fi
+        done < "$TMP_RESULTS"
+    fi
 
-# Spyder project settings
-.spyderproject
-.spyproject
+    # ─── Output ─────────────────────────────────────────────────────────
+    echo -e "${B}╔══════════════════════════════════════════════════════╗${N}"
+    echo -e "${B}║${N}  Results                                          ${B}║${N}"
+    echo -e "${B}╚══════════════════════════════════════════════════════╝${N}"
+    echo ""
 
-# Rope project settings
-.ropeproject
+    # Live HTTP/HTTPS hosts
+    if [ "$live_count" -gt 0 ]; then
+        echo -e "${G}[+] Live HTTP/HTTPS hosts:${N}"
+        # Sort by IP for readability
+        IFS=$'\n' sorted=($(sort -t'|' -k2 <<< "${live_hosts[*]}"))
+        unset IFS
+        printf '%s\n' "${sorted[@]}" > "$OUTPUT"
 
-# mkdocs documentation
-/site
+        for entry in "${sorted[@]}"; do
+            IFS='|' read -r domain ip extra <<< "$entry"
+            printf "  ${G}%-40s${N} %-15s %s\n" "$domain" "$ip" "$extra"
+        done
+        echo ""
+    fi
 
-# mypy
-.mypy_cache/
-.dmypy.json
-dmypy.json
+    # DNS-resolving but no HTTP
+    if [ "$dns_only_count" -gt 0 ]; then
+        echo -e "${Y}[~] DNS resolves (no HTTP response):${N}"
+        IFS=$'\n' sorted=($(sort -t'|' -k2 <<< "${dns_only_hosts[*]}"))
+        unset IFS
 
-# Pyre type checker
-.pyre/
+        for entry in "${sorted[@]}"; do
+            IFS='|' read -r domain ip extra <<< "$entry"
+            printf "  ${Y}%-40s${N} %-15s ${W}%s${N}\n" "$domain" "$ip" "$extra"
+        done
+        echo ""
+    fi
 
-# pytype static type analyzer
-.pytype/
+    # Summary
+    echo -e "${B}──────────────────────────────────────────────${N}"
+    echo -e "  Total input : ${W}$total${N}"
+    echo -e "  Live (HTTP) : ${G}$live_count${N}"
+    echo -e "  DNS only    : ${Y}$dns_only_count${N}"
+    echo -e "  Dead        : ${R}$((total - live_count - dns_only_count))${N}"
+    echo ""
+    echo -e "  Output file : ${W}$OUTPUT${N}"
 
-# Cython debug symbols
-cython_debug/
+    if [ "$live_count" -gt 0 ] || [ "$dns_only_count" -gt 0 ]; then
+        echo ""
+        echo -e "  ${B}[*]${N} Next steps:"
+        echo -e "     cat $OUTPUT | awk -F'|' '{print \$1}' > live_domains.txt"
+        echo -e "     nmap -iL live_domains.txt -p 80,443,8080,8443"
+        echo -e "     httpx -l live_domains.txt -title -status-code -tech-detect"
+    fi
+}
 
-# PyCharm
-#   JetBrains specific template is maintained in a separate JetBrains.gitignore that can
-#   be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore
-#   and can be added to the global gitignore or merged into this file.  For a more nuclear
-#   option (not recommended) you can uncomment the following to ignore the entire idea folder.
-# .idea/
+# ─── Entry ───────────────────────────────────────────────────────────────────
+check_deps
 
-# Abstra
-#   Abstra is an AI-powered process automation framework.
-#   Ignore directories containing user credentials, local state, and settings.
-#   Learn more at https://abstra.io/docs
-.abstra/
+if [ "$#" -lt 1 ] || [ "$1" = "-h" ] || [ "$1" = "--help" ]; then
+    usage
+fi
 
-# Visual Studio Code
-#   Visual Studio Code specific template is maintained in a separate VisualStudioCode.gitignore 
-#   that can be found at https://github.com/github/gitignore/blob/main/Global/VisualStudioCode.gitignore
-#   and can be added to the global gitignore or merged into this file. However, if you prefer, 
-#   you could uncomment the following to ignore the entire vscode folder
-# .vscode/
-# Temporary file for partial code execution
-tempCodeRunnerFile.py
-
-# Ruff stuff:
-.ruff_cache/
-
-# PyPI configuration file
-.pypirc
-
-# Marimo
-marimo/_static/
-marimo/_lsp/
-__marimo__/
-
-# Streamlit
-.streamlit/secrets.toml
+main "$@"
